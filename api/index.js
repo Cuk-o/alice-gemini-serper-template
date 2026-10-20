@@ -140,7 +140,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
         contents,
         generationConfig: {
-          temperature: 0.5,
           maxOutputTokens: 240
         }
       })
@@ -150,7 +149,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error("Gemini request failed with HTTP", status, data?.error?.message || "");
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
@@ -225,12 +224,13 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
+    const geminiStartedAt = Date.now();
     const answer = await askGemini(
       text,
       oldHistory,
       searchContext,
       Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
-    );
+    ).finally(() => res.setHeader("Server-Timing", `gemini;dur=${Date.now() - geminiStartedAt}`));
 
     const history = [
       ...oldHistory,
@@ -240,7 +240,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
