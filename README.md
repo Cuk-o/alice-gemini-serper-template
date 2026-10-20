@@ -43,7 +43,7 @@
 
 Если задан **LLM_API_KEY**, навык использует его вместо Gemini. Подходит любой сервис с OpenAI-совместимым API:
 - **LLM_API_URL** — полный адрес `/chat/completions`, по умолчанию Groq: `https://api.groq.com/openai/v1/chat/completions`.
-- **LLM_MODEL** — имя модели, по умолчанию `llama-3.3-70b-versatile`.
+- **LLM_MODEL** — имя модели, по умолчанию `qwen/qwen3.8-27b`. Альтернатива — `openai/gpt-oss-120b`.
 
 Ключи вводятся только в **Vercel → Settings → Environment Variables**. Не размещайте их в исходном коде, GitHub, README, Яндекс Диалогах или сообщениях. Если ключ попал в открытый доступ, отзовите его и создайте новый.
 

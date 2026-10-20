@@ -6,7 +6,7 @@ const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const SERPER_TIMEOUT_MS = 600;
 const LLM_TIMEOUT_MS = 3000;
 const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-const DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile";
+const DEFAULT_LLM_MODEL = "qwen/qwen3.8-27b";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
