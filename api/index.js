@@ -62,7 +62,10 @@ async function fetchJson(url, options, timeoutMs) {
   const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
-    const data = await response.json().catch(() => ({}));
+    const data = await response.json().catch(error => {
+      if (error.name === "AbortError") throw error;
+      return {};
+    });
     return { response, data };
   } finally {
     clearTimeout(timer);
