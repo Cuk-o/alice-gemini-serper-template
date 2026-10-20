@@ -157,3 +157,17 @@ test("rewrite NO skips search for meta questions but never for explicit «най
   await askHandler("найди", history);
   assert.deepEqual(serperQueries, ["последний фильм марвел найди"]);
 });
+
+test("empty LLM answer is retried once", async t => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls++;
+    const content = calls === 1 ? "" : "Всё отлично!";
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  t.after(() => delete process.env.LLM_API_KEY);
+  const payload = await askHandler("как дела");
+  assert.equal(payload.response.text, "Всё отлично!");
+  assert.equal(calls, 2);
+});

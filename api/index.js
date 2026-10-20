@@ -7,6 +7,7 @@ const SERPER_TIMEOUT_MS = 2500;
 const LLM_RESERVE_MS = 1800;
 const LLM_TIMEOUT_MS = 3000;
 const QUERY_REWRITE_TIMEOUT_MS = 1000;
+const RETRYABLE_LLM_ERRORS = ["LLM_EMPTY_RESPONSE", "LLM_REQUEST_FAILED"];
 const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "qwen/qwen3.8-27b";
 
@@ -199,7 +200,6 @@ async function buildSearchQuery(text, history) {
   if (!process.env.LLM_API_KEY) return fallback;
 
   const dialog = safeHistory(history)
-    .slice(-4)
     .map(item => `${item.role === "model" ? "Ассистент" : "Пользователь"}: ${item.text}`)
     .concat(`Пользователь: ${text}`)
     .join("\n");
@@ -209,7 +209,7 @@ async function buildSearchQuery(text, history) {
       { role: "system", content: `${QUERY_REWRITE_PROMPT} Сегодня ${today()}.` },
       { role: "user", content: dialog }
     ], { max_tokens: 40, temperature: 0 }, QUERY_REWRITE_TIMEOUT_MS);
-    if (/^нет[.!\s]*$/i.test(answer)) return isSearchIntent(text) ? fallback : "";
+    if (/^нет[.!\s]*$/i.test(answer)) return /найди|поищи|\b(search|look up)\b/i.test(text) ? fallback : "";
     return answer.replace(/^["«]|["»]$/g, "") || fallback;
   } catch (error) {
     console.warn("Search query rewrite failed; searching with the previous question:", error?.message || "unknown error");
@@ -332,13 +332,14 @@ export default async function handler(req, res) {
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
+    const askInBudget = () => ask(text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)));
     const llmStartedAt = Date.now();
-    const answer = await ask(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
-    ).finally(() => res.setHeader("Server-Timing", `query;dur=${queryMs}, search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
+    // Groq occasionally returns an empty answer or a 5xx; one retry fits in the budget.
+    const answer = await askInBudget().catch(error => {
+      if (!RETRYABLE_LLM_ERRORS.includes(error?.message) || remainingMs() < 1500) throw error;
+      console.warn("Retrying LLM after:", error.message);
+      return askInBudget();
+    }).finally(() => res.setHeader("Server-Timing", `query;dur=${queryMs}, search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
 
     const history = [
       ...oldHistory,
