@@ -2,8 +2,9 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 4000;
-const SERPER_TIMEOUT_MS = 1200;
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 2500;
+const LLM_RESERVE_MS = 1800;
 const LLM_TIMEOUT_MS = 3000;
 const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "qwen/qwen3.8-27b";
@@ -264,9 +265,12 @@ export default async function handler(req, res) {
 
   try {
     let searchContext = "";
+    let searchMs = 0;
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
+      const searchStartedAt = Date.now();
+      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
+      searchMs = Date.now() - searchStartedAt;
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
@@ -276,7 +280,7 @@ export default async function handler(req, res) {
       oldHistory,
       searchContext,
       Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
-    ).finally(() => res.setHeader("Server-Timing", `llm;dur=${Date.now() - llmStartedAt}`));
+    ).finally(() => res.setHeader("Server-Timing", `search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
 
     const history = [
       ...oldHistory,
