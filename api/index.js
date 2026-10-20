@@ -6,6 +6,7 @@ const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 2500;
 const LLM_RESERVE_MS = 1800;
 const LLM_TIMEOUT_MS = 3000;
+const SEARCH_DECISION_TIMEOUT_MS = 1200;
 const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "qwen/qwen3.8-27b";
 
@@ -18,9 +19,21 @@ const SYSTEM_PROMPT = [
   "Твои знания могут быть устаревшими: если вопрос о текущем положении дел, а результатов поиска нет, предупреди об этом и предложи спросить со словом «найди»."
 ].join(" ");
 
+const SEARCH_DECISION_PROMPT = [
+  "Реши, нужен ли поиск в интернете, чтобы ответить на последнюю реплику пользователя.",
+  "Поиск нужен, если ответ зависит от свежих данных или фактов, которые могли измениться: новости, цены, курсы, погода, спорт и чемпионы, релизы и новинки, даты недавних событий, кто сейчас занимает должность.",
+  "Учитывай контекст диалога: уточняющий вопрос о свежей теме тоже требует поиска. Если сомневаешься, выбирай поиск.",
+  "Ответь строго одной строкой: «ПОИСК: <короткий самодостаточный поисковый запрос>» или «НЕТ».",
+  "Примеры: «кто чемпион мира по футболу» → ПОИСК: чемпион мира по футболу последний; «почему небо голубое» → НЕТ;",
+  "после вопроса о последнем фильме Marvel «а когда он вышел» → ПОИСК: дата выхода последнего фильма Marvel."
+].join(" ");
+
+function today() {
+  return new Date().toLocaleDateString("ru-RU", { dateStyle: "long", timeZone: "Europe/Moscow" });
+}
+
 function systemPrompt() {
-  const today = new Date().toLocaleDateString("ru-RU", { dateStyle: "long", timeZone: "Europe/Moscow" });
-  return `${SYSTEM_PROMPT} Сегодня ${today}.`;
+  return `${SYSTEM_PROMPT} Сегодня ${today()}.`;
 }
 
 function aliceResponse(text, endSession = false, history = []) {
@@ -138,18 +151,7 @@ function checkLlmResponse(response, data, provider) {
 }
 
 // Any OpenAI-compatible chat API: Groq by default, or set LLM_API_URL/LLM_MODEL.
-async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const messages = [
-    { role: "system", content: systemPrompt() },
-    ...safeHistory(history).map(item => ({
-      role: item.role === "model" ? "assistant" : "user",
-      content: item.text
-    })),
-    { role: "user", content: buildPrompt(text, searchContext) }
-  ];
-
+async function chatCompletion(messages, options, timeoutMs) {
   const { response, data } = await fetchJson(
     process.env.LLM_API_URL || DEFAULT_LLM_API_URL,
     {
@@ -161,16 +163,51 @@ async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
       body: JSON.stringify({
         model: process.env.LLM_MODEL || DEFAULT_LLM_MODEL,
         messages,
-        max_tokens: 240
+        ...options
       })
     },
-    Math.min(LLM_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
   checkLlmResponse(response, data, "LLM");
+  return String(data?.choices?.[0]?.message?.content || "").trim();
+}
 
-  const answer = String(data?.choices?.[0]?.message?.content || "").trim();
+async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const answer = await chatCompletion([
+    { role: "system", content: systemPrompt() },
+    ...safeHistory(history).map(item => ({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    })),
+    { role: "user", content: buildPrompt(text, searchContext) }
+  ], { max_tokens: 240 }, Math.min(LLM_TIMEOUT_MS, timeoutMs));
   if (!answer) throw new Error("LLM_EMPTY_RESPONSE");
   return answer;
+}
+
+// Returns a web search query, or "" when the question can be answered without search.
+async function decideSearchQuery(text, history) {
+  if (isSearchIntent(text)) return text;
+  if (!process.env.LLM_API_KEY) return "";
+
+  const dialog = safeHistory(history)
+    .slice(-2)
+    .map(item => `${item.role === "model" ? "Ассистент" : "Пользователь"}: ${item.text}`)
+    .concat(`Пользователь: ${text}`)
+    .join("\n");
+
+  try {
+    const answer = await chatCompletion([
+      { role: "system", content: `${SEARCH_DECISION_PROMPT} Сегодня ${today()}.` },
+      { role: "user", content: dialog }
+    ], { max_tokens: 40, temperature: 0 }, SEARCH_DECISION_TIMEOUT_MS);
+    return answer.match(/^ПОИСК:\s*(.+)/i)?.[1].trim() || "";
+  } catch (error) {
+    console.warn("Search decision failed; answering without search:", error?.message || "unknown error");
+    return "";
+  }
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
@@ -272,10 +309,13 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     let searchMs = 0;
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+    const decideStartedAt = Date.now();
+    const searchQuery = process.env.SERPER_API_KEY ? await decideSearchQuery(text, oldHistory) : "";
+    const decideMs = Date.now() - decideStartedAt;
+    if (searchQuery) {
       // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
       const searchStartedAt = Date.now();
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
+      searchContext = await searchWeb(searchQuery, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
       searchMs = Date.now() - searchStartedAt;
     }
 
@@ -286,7 +326,7 @@ export default async function handler(req, res) {
       oldHistory,
       searchContext,
       Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
-    ).finally(() => res.setHeader("Server-Timing", `search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
+    ).finally(() => res.setHeader("Server-Timing", `decide;dur=${decideMs}, search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
 
     const history = [
       ...oldHistory,

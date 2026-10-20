@@ -96,3 +96,25 @@ test("OpenAI-compatible provider is used when LLM_API_KEY is set", async t => {
   assert.match(fetchMock.mock.calls[0].arguments[0], /groq/);
   assert.equal(payload.session_state.history.at(-1).role, "model");
 });
+
+test("model decides when to search and writes the query", async t => {
+  const serperQueries = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url.includes("serper")) {
+      serperQueries.push(body.q);
+      return new Response(JSON.stringify({ organic: [{ title: "t", snippet: "s", link: "l" }] }), { status: 200 });
+    }
+    const isDecision = body.max_tokens === 40;
+    const question = body.messages.at(-1).content;
+    const content = isDecision ? (question.includes("чемпион") ? "ПОИСК: чемпион мира по футболу 2026" : "НЕТ") : "ответ";
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  process.env.SERPER_API_KEY = "test";
+  t.after(() => { delete process.env.LLM_API_KEY; delete process.env.SERPER_API_KEY; });
+
+  await askHandler("почему небо голубое");
+  await askHandler("кто чемпион мира");
+  assert.deepEqual(serperQueries, ["чемпион мира по футболу 2026"]);
+});
