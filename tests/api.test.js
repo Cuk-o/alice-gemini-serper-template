@@ -117,3 +117,22 @@ test("searches everything except one-word small talk, rewriting follow-ups", asy
   await askHandler("а когда он вышел", [{ role: "user", text: "последний фильм марвел" }, { role: "model", text: "ответ" }]);
   assert.deepEqual(serperQueries, ["кто чемпион мира", "дата выхода последнего фильма Marvel"]);
 });
+
+test("follow-up search falls back to the previous question when rewrite fails", async t => {
+  const serperQueries = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url.includes("serper")) {
+      serperQueries.push(body.q);
+      return new Response("{}", { status: 200 });
+    }
+    if (body.max_tokens === 40) return new Response("{}", { status: 503 });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "ответ" } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  process.env.SERPER_API_KEY = "test";
+  t.after(() => { delete process.env.LLM_API_KEY; delete process.env.SERPER_API_KEY; });
+
+  await askHandler("а когда он вышел", [{ role: "user", text: "последний фильм марвел" }, { role: "model", text: "ответ" }]);
+  assert.deepEqual(serperQueries, ["последний фильм марвел а когда он вышел"]);
+});

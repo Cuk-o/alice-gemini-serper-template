@@ -191,7 +191,10 @@ function shouldSearch(text) {
 
 // Follow-ups like «а когда он вышел» need the dialog context to become a usable query.
 async function buildSearchQuery(text, history) {
-  if (!history.length || !process.env.LLM_API_KEY) return text;
+  if (!history.length) return text;
+  const lastUserText = history.findLast(item => item.role === "user")?.text || "";
+  const fallback = `${lastUserText} ${text}`.trim();
+  if (!process.env.LLM_API_KEY) return fallback;
 
   const dialog = safeHistory(history)
     .slice(-2)
@@ -204,10 +207,10 @@ async function buildSearchQuery(text, history) {
       { role: "system", content: `${QUERY_REWRITE_PROMPT} Сегодня ${today()}.` },
       { role: "user", content: dialog }
     ], { max_tokens: 40, temperature: 0 }, QUERY_REWRITE_TIMEOUT_MS);
-    return answer.replace(/^["«]|["»]$/g, "") || text;
+    return answer.replace(/^["«]|["»]$/g, "") || fallback;
   } catch (error) {
-    console.warn("Search query rewrite failed; searching the raw text:", error?.message || "unknown error");
-    return text;
+    console.warn("Search query rewrite failed; searching with the previous question:", error?.message || "unknown error");
+    return fallback;
   }
 }
 
