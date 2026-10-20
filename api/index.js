@@ -24,13 +24,20 @@ const SYSTEM_PROMPT = [
 
 const QUERY_REWRITE_PROMPT = [
   "Перепиши последнюю реплику пользователя в короткий самодостаточный поисковый запрос с учётом контекста диалога.",
-  "Ответь только запросом, без пояснений. Если реплика о самом разговоре или ассистенте и поиск не поможет, ответь НЕТ.",
+  "Ответь только запросом, без пояснений. Если в реплике две разные темы, напиши два запроса, каждый на отдельной строке.",
+  "НЕТ отвечай только на реплики о самом разговоре или ассистенте (например «почему ты так ответила», «спасибо, понял»); на любой вопрос о мире, даже простой, пиши запрос.",
   "Примеры: после вопроса о последнем фильме Marvel «а когда он вышел» → дата выхода последнего фильма Marvel;",
   "«найди» или «поищи» без темы → поисковый запрос по предыдущему вопросу пользователя с названиями из диалога."
 ].join(" ");
 
-function today() {
-  return new Date().toLocaleDateString("ru-RU", { dateStyle: "long", timeZone: "Europe/Moscow" });
+// The model can't count weekdays, so name the nearest weekend explicitly.
+function today(now = new Date()) {
+  const format = date => date.toLocaleDateString("ru-RU", { day: "numeric", month: "long", timeZone: "Europe/Moscow" });
+  const weekday = new Date(now.toLocaleString("en-US", { timeZone: "Europe/Moscow" })).getDay();
+  const saturday = new Date(now.getTime() + ((6 - weekday + 7) % 7) * 86400000);
+  const sunday = new Date(saturday.getTime() + 86400000);
+  const date = now.toLocaleDateString("ru-RU", { dateStyle: "full", timeZone: "Europe/Moscow" });
+  return `${date}, ближайшие выходные — ${format(saturday)} и ${format(sunday)}`;
 }
 
 function systemPrompt() {
@@ -95,7 +102,7 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
-async function searchWeb(query, timeoutMs) {
+async function searchWeb(query, timeoutMs, limit = 5) {
   const key = process.env.SERPER_API_KEY;
   if (!key || timeoutMs < 150) return "";
 
@@ -108,7 +115,7 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 5 })
+        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: limit })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
@@ -119,7 +126,7 @@ async function searchWeb(query, timeoutMs) {
     }
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 5)
+      .slice(0, limit)
       .map((item, i) => {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
@@ -193,11 +200,11 @@ function shouldSearch(text) {
   return isSearchIntent(text) || text.split(/\s+/).length > 1;
 }
 
-// Follow-ups like «а когда он вышел» need the dialog context to become a usable query; "" skips search.
-async function buildSearchQuery(text, history) {
-  if (!history.length) return text;
+// The LLM turns the reply into up to two clean queries, resolving follow-ups like «а когда он вышел»
+// from the dialog and splitting «погода в Актау и курс тенге» by topic; [] skips search.
+async function buildSearchQueries(text, history) {
   const lastUserText = history.findLast(item => item.role === "user")?.text || "";
-  const fallback = `${lastUserText} ${text}`.trim();
+  const fallback = [`${lastUserText} ${text}`.trim()];
   if (!process.env.LLM_API_KEY) return fallback;
 
   const dialog = safeHistory(history)
@@ -209,9 +216,14 @@ async function buildSearchQuery(text, history) {
     const answer = await chatCompletion([
       { role: "system", content: `${QUERY_REWRITE_PROMPT} Сегодня ${today()}.` },
       { role: "user", content: dialog }
-    ], { max_tokens: 40, temperature: 0 }, QUERY_REWRITE_TIMEOUT_MS);
-    if (/^нет[.!\s]*$/i.test(answer)) return /найди|поищи|\b(search|look up)\b/i.test(text) ? fallback : "";
-    return answer.replace(/^["«]|["»]$/g, "") || fallback;
+    ], { max_tokens: 60, temperature: 0 }, QUERY_REWRITE_TIMEOUT_MS);
+    if (/^нет[.!\s]*$/i.test(answer)) return /найди|поищи|\b(search|look up)\b/i.test(text) ? fallback : [];
+    const queries = answer
+      .split("\n")
+      .map(line => line.replace(/^(\d+[.)]|[-•])\s+/, "").replace(/^["«](.*)["»]$/, "$1").trim())
+      .filter(Boolean)
+      .slice(0, 2);
+    return queries.length ? queries : fallback;
   } catch (error) {
     console.warn("Search query rewrite failed; searching with the previous question:", error?.message || "unknown error");
     return fallback;
@@ -320,15 +332,20 @@ export default async function handler(req, res) {
     let queryMs = 0;
     if (process.env.SERPER_API_KEY && shouldSearch(text)) {
       const queryStartedAt = Date.now();
-      const searchQuery = await buildSearchQuery(text, oldHistory);
+      const queries = await buildSearchQueries(text, oldHistory);
       queryMs = Date.now() - queryStartedAt;
-      if (searchQuery) {
+      if (queries.length) {
         // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
+        const searchBudget = Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS));
         const searchStartedAt = Date.now();
-        const found = await searchWeb(searchQuery, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
+        // Two topics run in parallel with fewer results each to keep the prompt small.
+        const found = await Promise.all(queries.map(query => searchWeb(query, searchBudget, queries.length > 1 ? 3 : 5)));
         searchMs = Date.now() - searchStartedAt;
-        console.log(`Search ${searchMs}ms ${found ? "ok" : "empty"}: ${searchQuery}`);
-        searchContext = found || "Поиск не дал результатов. Не выдумывай свежие факты: скажи, что не получилось проверить в интернете.";
+        console.log(`Search ${searchMs}ms ${found.map(item => item ? "ok" : "empty").join("/")}: ${queries.join(" | ")}`);
+        searchContext = found
+          .map((item, i) => item && (queries.length > 1 ? `По запросу «${queries[i]}»:\n${item}` : item))
+          .filter(Boolean)
+          .join("\n\n") || "Поиск не дал результатов. Не выдумывай свежие факты: скажи, что не получилось проверить в интернете.";
       }
     }
 
