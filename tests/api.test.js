@@ -181,7 +181,8 @@ test("two topics become two parallel searches", async t => {
     const body = JSON.parse(options.body);
     if (url.includes("serper")) {
       serperQueries.push([body.q, body.num]);
-      return new Response(JSON.stringify({ organic: [{ title: body.q, snippet: "s", link: "l" }] }), { status: 200 });
+      const organic = body.q.includes("курс") ? [] : [{ title: body.q, snippet: "s", link: "l" }];
+      return new Response(JSON.stringify({ organic }), { status: 200 });
     }
     if (body.max_tokens === 60) {
       return new Response(JSON.stringify({ choices: [{ message: { content: "1. погода в Актау на выходные\n2. курс тенге к рублю" } }] }), { status: 200 });
@@ -196,5 +197,5 @@ test("two topics become two parallel searches", async t => {
   await askHandler("а в актау на выходных и курс кз-рф подскажи");
   assert.deepEqual(serperQueries, [["погода в Актау на выходные", 3], ["курс тенге к рублю", 3]]);
   assert.match(answerPrompt, /По запросу «погода в Актау на выходные»/);
-  assert.match(answerPrompt, /По запросу «курс тенге к рублю»/);
+  assert.match(answerPrompt, /По запросу «курс тенге к рублю»: результатов нет/);
 });
