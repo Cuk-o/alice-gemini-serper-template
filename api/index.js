@@ -14,15 +14,17 @@ const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Поиск в интернете выполняется автоматически, его результаты приходят вместе с вопросом. Никогда не говори, что не умеешь искать.",
+  "Результаты поиска свежее твоих знаний: если они расходятся с тем, что ты помнишь, верь поиску. Не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом.",
-  "Твои знания могут быть устаревшими: если вопрос о текущем положении дел, а результатов поиска нет, предупреди об этом и предложи спросить со словом «найди»."
+  "Твои знания могут быть устаревшими: если вопрос о текущем положении дел, а результатов поиска нет, скажи, что не получилось проверить в интернете, и предложи повторить вопрос."
 ].join(" ");
 
 const QUERY_REWRITE_PROMPT = [
   "Перепиши последнюю реплику пользователя в короткий самодостаточный поисковый запрос с учётом контекста диалога.",
-  "Ответь только запросом, без пояснений.",
-  "Пример: после вопроса о последнем фильме Marvel «а когда он вышел» → дата выхода последнего фильма Marvel."
+  "Ответь только запросом, без пояснений. Если реплика о самом разговоре или ассистенте и поиск не поможет, ответь НЕТ.",
+  "Примеры: после вопроса о последнем фильме Marvel «а когда он вышел» → дата выхода последнего фильма Marvel;",
+  "«найди» или «поищи» без темы → поисковый запрос по предыдущему вопросу пользователя с названиями из диалога."
 ].join(" ");
 
 function today() {
@@ -104,7 +106,7 @@ async function searchWeb(query, timeoutMs) {
           "X-API-KEY": key,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
+        body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 5 })
       },
       Math.min(SERPER_TIMEOUT_MS, timeoutMs)
     );
@@ -115,7 +117,7 @@ async function searchWeb(query, timeoutMs) {
     }
 
     const items = (Array.isArray(data.organic) ? data.organic : [])
-      .slice(0, 3)
+      .slice(0, 5)
       .map((item, i) => {
         const title = String(item.title || "").slice(0, 180);
         const snippet = String(item.snippet || "").slice(0, 350);
@@ -189,7 +191,7 @@ function shouldSearch(text) {
   return isSearchIntent(text) || text.split(/\s+/).length > 1;
 }
 
-// Follow-ups like «а когда он вышел» need the dialog context to become a usable query.
+// Follow-ups like «а когда он вышел» need the dialog context to become a usable query; "" skips search.
 async function buildSearchQuery(text, history) {
   if (!history.length) return text;
   const lastUserText = history.findLast(item => item.role === "user")?.text || "";
@@ -197,7 +199,7 @@ async function buildSearchQuery(text, history) {
   if (!process.env.LLM_API_KEY) return fallback;
 
   const dialog = safeHistory(history)
-    .slice(-2)
+    .slice(-4)
     .map(item => `${item.role === "model" ? "Ассистент" : "Пользователь"}: ${item.text}`)
     .concat(`Пользователь: ${text}`)
     .join("\n");
@@ -207,6 +209,7 @@ async function buildSearchQuery(text, history) {
       { role: "system", content: `${QUERY_REWRITE_PROMPT} Сегодня ${today()}.` },
       { role: "user", content: dialog }
     ], { max_tokens: 40, temperature: 0 }, QUERY_REWRITE_TIMEOUT_MS);
+    if (/^нет[.!\s]*$/i.test(answer)) return isSearchIntent(text) ? fallback : "";
     return answer.replace(/^["«]|["»]$/g, "") || fallback;
   } catch (error) {
     console.warn("Search query rewrite failed; searching with the previous question:", error?.message || "unknown error");
@@ -318,11 +321,14 @@ export default async function handler(req, res) {
       const queryStartedAt = Date.now();
       const searchQuery = await buildSearchQuery(text, oldHistory);
       queryMs = Date.now() - queryStartedAt;
-      // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
-      const searchStartedAt = Date.now();
-      searchContext = await searchWeb(searchQuery, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
-      searchMs = Date.now() - searchStartedAt;
-      console.log(`Search ${searchMs}ms ${searchContext ? "ok" : "empty"}: ${searchQuery}`);
+      if (searchQuery) {
+        // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
+        const searchStartedAt = Date.now();
+        const found = await searchWeb(searchQuery, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
+        searchMs = Date.now() - searchStartedAt;
+        console.log(`Search ${searchMs}ms ${found ? "ok" : "empty"}: ${searchQuery}`);
+        searchContext = found || "Поиск не дал результатов. Не выдумывай свежие факты: скажи, что не получилось проверить в интернете.";
+      }
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;

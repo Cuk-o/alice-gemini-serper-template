@@ -136,3 +136,24 @@ test("follow-up search falls back to the previous question when rewrite fails", 
   await askHandler("а когда он вышел", [{ role: "user", text: "последний фильм марвел" }, { role: "model", text: "ответ" }]);
   assert.deepEqual(serperQueries, ["последний фильм марвел а когда он вышел"]);
 });
+
+test("rewrite NO skips search for meta questions but never for explicit «найди»", async t => {
+  const serperQueries = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url.includes("serper")) {
+      serperQueries.push(body.q);
+      return new Response("{}", { status: 200 });
+    }
+    const content = body.max_tokens === 40 ? "НЕТ" : "ответ";
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  process.env.SERPER_API_KEY = "test";
+  t.after(() => { delete process.env.LLM_API_KEY; delete process.env.SERPER_API_KEY; });
+
+  const history = [{ role: "user", text: "последний фильм марвел" }, { role: "model", text: "ответ" }];
+  await askHandler("почему ты сразу не сказала", history);
+  await askHandler("найди", history);
+  assert.deepEqual(serperQueries, ["последний фильм марвел найди"]);
+});
