@@ -61,3 +61,38 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.match(payload.response.text, /Привет/);
   assert.equal(payload.response.end_session, false);
 });
+
+async function askHandler(command) {
+  const handler = (await import("../api/index.js")).default;
+  let payload;
+  const res = {
+    status() { return this; },
+    json(value) { payload = value; return value; },
+    setHeader() {}
+  };
+  await handler({ method: "POST", body: { request: { command }, state: { session: { history: [] } } } }, res);
+  return payload;
+}
+
+test("slow model answer becomes a timeout message", async t => {
+  t.mock.method(globalThis, "fetch", (url, { signal }) => new Promise((_, reject) => {
+    signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
+  }));
+  process.env.GEMINI_API_KEY = "test";
+  t.after(() => delete process.env.GEMINI_API_KEY);
+  const payload = await askHandler("привет");
+  assert.match(payload.response.text, /Не успела/);
+});
+
+test("OpenAI-compatible provider is used when LLM_API_KEY is set", async t => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response(
+    JSON.stringify({ choices: [{ message: { content: "Привет!" } }] }),
+    { status: 200 }
+  ));
+  process.env.LLM_API_KEY = "test";
+  t.after(() => delete process.env.LLM_API_KEY);
+  const payload = await askHandler("привет");
+  assert.equal(payload.response.text, "Привет!");
+  assert.match(fetchMock.mock.calls[0].arguments[0], /groq/);
+  assert.equal(payload.session_state.history.at(-1).role, "model");
+});

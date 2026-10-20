@@ -2,9 +2,11 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 4000;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const LLM_TIMEOUT_MS = 3000;
+const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+const DEFAULT_LLM_MODEL = "llama-3.3-70b-versatile";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -113,9 +115,60 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function buildPrompt(text, searchContext) {
+  return searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
+}
+
+function checkLlmResponse(response, data, provider) {
+  if (response.ok) return;
+  const status = Number(response.status);
+  console.error(`${provider} request failed with HTTP`, status, data?.error?.message || "");
+  if (status === 401 || status === 403) throw new Error("LLM_KEY_REJECTED");
+  if (status === 429) throw new Error("LLM_QUOTA");
+  throw new Error("LLM_REQUEST_FAILED");
+}
+
+// Any OpenAI-compatible chat API: Groq by default, or set LLM_API_URL/LLM_MODEL.
+async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...safeHistory(history).map(item => ({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    })),
+    { role: "user", content: buildPrompt(text, searchContext) }
+  ];
+
+  const { response, data } = await fetchJson(
+    process.env.LLM_API_URL || DEFAULT_LLM_API_URL,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.LLM_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.LLM_MODEL || DEFAULT_LLM_MODEL,
+        messages,
+        max_tokens: 240
+      })
+    },
+    Math.min(LLM_TIMEOUT_MS, timeoutMs)
+  );
+  checkLlmResponse(response, data, "LLM");
+
+  const answer = String(data?.choices?.[0]?.message?.content || "").trim();
+  if (!answer) throw new Error("LLM_EMPTY_RESPONSE");
+  return answer;
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+  if (!key) throw new Error("MISSING_LLM_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
@@ -126,10 +179,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     parts: [{ text: item.text }]
   }));
 
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  contents.push({ role: "user", parts: [{ text: buildPrompt(text, searchContext) }] });
 
   const { response, data } = await fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -147,16 +197,9 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(LLM_TIMEOUT_MS, timeoutMs)
   );
-
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status, data?.error?.message || "");
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
+  checkLlmResponse(response, data, "Gemini");
 
   const candidate = data?.candidates?.[0];
   const answer = (candidate?.content?.parts || [])
@@ -165,8 +208,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     .trim();
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+    if (data?.promptFeedback?.blockReason) throw new Error("LLM_BLOCKED");
+    throw new Error("LLM_EMPTY_RESPONSE");
   }
   if (candidate?.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
@@ -176,16 +219,15 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
+    case "MISSING_LLM_KEY":
+      return "Сервер пока не настроен. Добавьте LLM_API_KEY или GEMINI_API_KEY в настройках Vercel.";
+    case "LLM_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+    case "LLM_QUOTA":
+      return "Сейчас превышен лимит запросов к нейросети. Попробуйте немного позже.";
+    case "LLM_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -227,13 +269,14 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const geminiStartedAt = Date.now();
-    const answer = await askGemini(
+    const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
+    const llmStartedAt = Date.now();
+    const answer = await ask(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
-    ).finally(() => res.setHeader("Server-Timing", `gemini;dur=${Date.now() - geminiStartedAt}`));
+      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
+    ).finally(() => res.setHeader("Server-Timing", `llm;dur=${Date.now() - llmStartedAt}`));
 
     const history = [
       ...oldHistory,
@@ -243,7 +286,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.name === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
