@@ -6,7 +6,7 @@ const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SERPER_TIMEOUT_MS = 2500;
 const LLM_RESERVE_MS = 1800;
 const LLM_TIMEOUT_MS = 3000;
-const SEARCH_DECISION_TIMEOUT_MS = 1200;
+const QUERY_REWRITE_TIMEOUT_MS = 1000;
 const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "qwen/qwen3.8-27b";
 
@@ -19,13 +19,10 @@ const SYSTEM_PROMPT = [
   "Твои знания могут быть устаревшими: если вопрос о текущем положении дел, а результатов поиска нет, предупреди об этом и предложи спросить со словом «найди»."
 ].join(" ");
 
-const SEARCH_DECISION_PROMPT = [
-  "Реши, нужен ли поиск в интернете, чтобы ответить на последнюю реплику пользователя.",
-  "Поиск нужен, если ответ зависит от свежих данных или фактов, которые могли измениться: новости, цены, курсы, погода, спорт и чемпионы, релизы и новинки, даты недавних событий, кто сейчас занимает должность.",
-  "Учитывай контекст диалога: уточняющий вопрос о свежей теме тоже требует поиска. Если сомневаешься, выбирай поиск.",
-  "Ответь строго одной строкой: «ПОИСК: <короткий самодостаточный поисковый запрос>» или «НЕТ».",
-  "Примеры: «кто чемпион мира по футболу» → ПОИСК: чемпион мира по футболу последний; «почему небо голубое» → НЕТ;",
-  "после вопроса о последнем фильме Marvel «а когда он вышел» → ПОИСК: дата выхода последнего фильма Marvel."
+const QUERY_REWRITE_PROMPT = [
+  "Перепиши последнюю реплику пользователя в короткий самодостаточный поисковый запрос с учётом контекста диалога.",
+  "Ответь только запросом, без пояснений.",
+  "Пример: после вопроса о последнем фильме Marvel «а когда он вышел» → дата выхода последнего фильма Marvel."
 ].join(" ");
 
 function today() {
@@ -187,10 +184,14 @@ async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
-// Returns a web search query, or "" when the question can be answered without search.
-async function decideSearchQuery(text, history) {
-  if (isSearchIntent(text)) return text;
-  if (!process.env.LLM_API_KEY) return "";
+// Search everything except one-word small talk like «привет» or «спасибо».
+function shouldSearch(text) {
+  return isSearchIntent(text) || text.split(/\s+/).length > 1;
+}
+
+// Follow-ups like «а когда он вышел» need the dialog context to become a usable query.
+async function buildSearchQuery(text, history) {
+  if (!history.length || !process.env.LLM_API_KEY) return text;
 
   const dialog = safeHistory(history)
     .slice(-2)
@@ -200,13 +201,13 @@ async function decideSearchQuery(text, history) {
 
   try {
     const answer = await chatCompletion([
-      { role: "system", content: `${SEARCH_DECISION_PROMPT} Сегодня ${today()}.` },
+      { role: "system", content: `${QUERY_REWRITE_PROMPT} Сегодня ${today()}.` },
       { role: "user", content: dialog }
-    ], { max_tokens: 40, temperature: 0 }, SEARCH_DECISION_TIMEOUT_MS);
-    return answer.match(/^ПОИСК:\s*(.+)/i)?.[1].trim() || "";
+    ], { max_tokens: 40, temperature: 0 }, QUERY_REWRITE_TIMEOUT_MS);
+    return answer.replace(/^["«]|["»]$/g, "") || text;
   } catch (error) {
-    console.warn("Search decision failed; answering without search:", error?.message || "unknown error");
-    return "";
+    console.warn("Search query rewrite failed; searching the raw text:", error?.message || "unknown error");
+    return text;
   }
 }
 
@@ -309,14 +310,16 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     let searchMs = 0;
-    const decideStartedAt = Date.now();
-    const searchQuery = process.env.SERPER_API_KEY ? await decideSearchQuery(text, oldHistory) : "";
-    const decideMs = Date.now() - decideStartedAt;
-    if (searchQuery) {
+    let queryMs = 0;
+    if (process.env.SERPER_API_KEY && shouldSearch(text)) {
+      const queryStartedAt = Date.now();
+      const searchQuery = await buildSearchQuery(text, oldHistory);
+      queryMs = Date.now() - queryStartedAt;
       // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
       const searchStartedAt = Date.now();
       searchContext = await searchWeb(searchQuery, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS)));
       searchMs = Date.now() - searchStartedAt;
+      console.log(`Search ${searchMs}ms ${searchContext ? "ok" : "empty"}: ${searchQuery}`);
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
@@ -326,7 +329,7 @@ export default async function handler(req, res) {
       oldHistory,
       searchContext,
       Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
-    ).finally(() => res.setHeader("Server-Timing", `decide;dur=${decideMs}, search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
+    ).finally(() => res.setHeader("Server-Timing", `query;dur=${queryMs}, search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
 
     const history = [
       ...oldHistory,

@@ -62,7 +62,7 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.equal(payload.response.end_session, false);
 });
 
-async function askHandler(command) {
+async function askHandler(command, history = []) {
   const handler = (await import("../api/index.js")).default;
   let payload;
   const res = {
@@ -70,7 +70,7 @@ async function askHandler(command) {
     json(value) { payload = value; return value; },
     setHeader() {}
   };
-  await handler({ method: "POST", body: { request: { command }, state: { session: { history: [] } } } }, res);
+  await handler({ method: "POST", body: { request: { command }, state: { session: { history } } } }, res);
   return payload;
 }
 
@@ -97,7 +97,7 @@ test("OpenAI-compatible provider is used when LLM_API_KEY is set", async t => {
   assert.equal(payload.session_state.history.at(-1).role, "model");
 });
 
-test("model decides when to search and writes the query", async t => {
+test("searches everything except one-word small talk, rewriting follow-ups", async t => {
   const serperQueries = [];
   t.mock.method(globalThis, "fetch", async (url, options) => {
     const body = JSON.parse(options.body);
@@ -105,16 +105,15 @@ test("model decides when to search and writes the query", async t => {
       serperQueries.push(body.q);
       return new Response(JSON.stringify({ organic: [{ title: "t", snippet: "s", link: "l" }] }), { status: 200 });
     }
-    const isDecision = body.max_tokens === 40;
-    const question = body.messages.at(-1).content;
-    const content = isDecision ? (question.includes("чемпион") ? "ПОИСК: чемпион мира по футболу 2026" : "НЕТ") : "ответ";
+    const content = body.max_tokens === 40 ? "дата выхода последнего фильма Marvel" : "ответ";
     return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
   });
   process.env.LLM_API_KEY = "test";
   process.env.SERPER_API_KEY = "test";
   t.after(() => { delete process.env.LLM_API_KEY; delete process.env.SERPER_API_KEY; });
 
-  await askHandler("почему небо голубое");
+  await askHandler("спасибо");
   await askHandler("кто чемпион мира");
-  assert.deepEqual(serperQueries, ["чемпион мира по футболу 2026"]);
+  await askHandler("а когда он вышел", [{ role: "user", text: "последний фильм марвел" }, { role: "model", text: "ответ" }]);
+  assert.deepEqual(serperQueries, ["кто чемпион мира", "дата выхода последнего фильма Marvel"]);
 });
