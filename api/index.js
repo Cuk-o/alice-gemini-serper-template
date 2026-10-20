@@ -14,8 +14,14 @@ const SYSTEM_PROMPT = [
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
-  "Если не знаешь ответа, честно скажи об этом."
+  "Если не знаешь ответа, честно скажи об этом.",
+  "Твои знания могут быть устаревшими: если вопрос о текущем положении дел, а результатов поиска нет, предупреди об этом и предложи спросить со словом «найди»."
 ].join(" ");
+
+function systemPrompt() {
+  const today = new Date().toLocaleDateString("ru-RU", { dateStyle: "long", timeZone: "Europe/Moscow" });
+  return `${SYSTEM_PROMPT} Сегодня ${today}.`;
+}
 
 function aliceResponse(text, endSession = false, history = []) {
   return {
@@ -136,7 +142,7 @@ async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const messages = [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt() },
     ...safeHistory(history).map(item => ({
       role: item.role === "model" ? "assistant" : "user",
       content: item.text
@@ -191,7 +197,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         "x-goog-api-key": key
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        systemInstruction: { parts: [{ text: systemPrompt() }] },
         contents,
         generationConfig: {
           maxOutputTokens: 240
