@@ -282,3 +282,29 @@ test("personal questions are recognized, questions about the world are not", () 
   for (const q of ["как зовут моего кота", "напомни есть ли у меня животные", "что я просил запомнить", "когда день рождения моей мамы"]) assert.equal(isPersonalQuestion(q), true, q);
   for (const q of ["есть ли у кошек паразиты", "какая погода в омске", "мойка машин рядом", "кто чемпион мира"]) assert.equal(isPersonalQuestion(q), false, q);
 });
+
+test("only the configured skill may call the webhook", async t => {
+  process.env.ALICE_SKILL_ID = "my-skill";
+  t.after(() => delete process.env.ALICE_SKILL_ID);
+  let status;
+  const res = { status(code) { status = code; return this; }, json() {}, setHeader() {} };
+  const handler = (await import("../api/index.js")).default;
+  await handler({ method: "POST", body: { session: { skill_id: "someone-else" }, request: { command: "привет" } } }, res);
+  assert.equal(status, 403);
+  assert.match((await askHandler("", [], { skill_id: "my-skill" })).response.text, /Привет/);
+});
+
+test("ping is answered without calling the LLM", async t => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => { throw new Error("must not be called"); });
+  process.env.LLM_API_KEY = "test";
+  t.after(() => delete process.env.LLM_API_KEY);
+  assert.equal((await askHandler("ping")).response.text, "ok");
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("session_state is trimmed to the Yandex size limit", () => {
+  const history = Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? "model" : "user", text: "ответ ".repeat(30) + i }));
+  const state = aliceResponse("x", false, history).session_state;
+  assert.ok(Buffer.byteLength(JSON.stringify(state)) <= 1000);
+  assert.equal(state.history.at(-1).text, history.at(-1).text);
+});

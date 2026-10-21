@@ -6,6 +6,8 @@ const MEMORY_TIMEOUT_MS = 300;
 const MAX_FACTS = 20;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
+// Yandex documents a 1 KB session_state limit; Redis keeps the full history anyway.
+const MAX_SESSION_STATE_BYTES = 1000;
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const SEARCH_TIMEOUT_MS = 2500;
 const LLM_RESERVE_MS = 1800;
@@ -62,8 +64,14 @@ function aliceResponse(text, endSession = false, history = []) {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: { history: fitSessionHistory(history) }
   };
+}
+
+function fitSessionHistory(history) {
+  const fitted = [...history];
+  while (fitted.length && Buffer.byteLength(JSON.stringify({ history: fitted })) > MAX_SESSION_STATE_BYTES) fitted.shift();
+  return fitted;
 }
 
 function fitAliceText(value) {
@@ -420,7 +428,17 @@ export default async function handler(req, res) {
   const startedAt = Date.now();
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
+
+  // Anyone who knows the URL could burn the LLM and search quotas; only our skill may call.
+  if (process.env.ALICE_SKILL_ID && body?.session?.skill_id !== process.env.ALICE_SKILL_ID) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
+
+  // Yandex health checks: answer at once without spending LLM calls or polluting memory.
+  if (text.toLowerCase() === "ping") return res.status(200).json(aliceResponse("ok"));
+
   const userId = body?.session?.user?.user_id || body?.session?.application?.application_id || "";
   const memory = await loadMemory(userId);
   const oldHistory = memory ? memory.history : safeHistory(body?.state?.session?.history);
