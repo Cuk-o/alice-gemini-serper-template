@@ -35,7 +35,7 @@ const SYSTEM_PROMPT = [
 const QUERY_REWRITE_PROMPT = [
   "Перепиши последнюю реплику пользователя в короткий самодостаточный поисковый запрос с учётом контекста диалога.",
   "Ответь только запросом, без пояснений. Если в реплике две разные темы, напиши два запроса, каждый на отдельной строке.",
-  "НЕТ отвечай только на реплики о самом разговоре или ассистенте (например «почему ты так ответила», «спасибо, понял»); на любой вопрос о мире, даже простой, пиши запрос.",
+  "НЕТ отвечай только на реплики о самом разговоре или ассистенте (например «почему ты так ответила», «спасибо, понял») и на вопросы о самом пользователе — его питомцах, близких, планах, том, что он просил запомнить («как зовут моего кота», «есть ли у меня животные»); на любой вопрос о мире, даже простой, пиши запрос.",
   "Примеры: после вопроса о последнем фильме Marvel «а когда он вышел» → дата выхода последнего фильма Marvel;",
   "«найди» или «поищи» без темы → поисковый запрос по предыдущему вопросу пользователя с названиями из диалога.",
   "Если спрашивают о последнем, новом или свежем, добавь в запрос текущий год, иначе поисковик вернёт старые статьи: «какой последний фильм марвел» → последний фильм Marvel 2026."
@@ -299,6 +299,11 @@ function shouldSearch(text) {
   return isSearchIntent(text) || text.split(/\s+/).length > 1;
 }
 
+// «как зовут моего кота» must come from memory: web results about other people's cats confuse the model.
+function isPersonalQuestion(text) {
+  return /(^|\s)(мо(й|я|ё|е|его|ей|ему|им|их|ими)|у меня есть|есть ли у меня|я (просил|говорил|рассказывал)а?|напомни)(?=[\s,?!.]|$)/i.test(text);
+}
+
 // The LLM turns the reply into up to two clean queries, resolving follow-ups like «а когда он вышел»
 // from the dialog and splitting «погода в Актау и курс тенге» by topic; [] skips search.
 async function buildSearchQueries(text, history) {
@@ -445,7 +450,7 @@ export default async function handler(req, res) {
     let searchContext = "";
     let searchMs = 0;
     let queryMs = 0;
-    if ((process.env.EXA_API_KEY || process.env.SERPER_API_KEY) && shouldSearch(text)) {
+    if ((process.env.EXA_API_KEY || process.env.SERPER_API_KEY) && shouldSearch(text) && !(facts.length && isPersonalQuestion(text))) {
       const queryStartedAt = Date.now();
       const queries = await buildSearchQueries(text, oldHistory);
       queryMs = Date.now() - queryStartedAt;
@@ -465,7 +470,7 @@ export default async function handler(req, res) {
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
-    const notes = facts.length ? `Пользователь раньше просил запомнить:\n- ${facts.join("\n- ")}\n\n` : "";
+    const notes = facts.length ? `Пользователь раньше просил запомнить (это точные факты о нём, они важнее результатов поиска):\n- ${facts.join("\n- ")}\n\n` : "";
     const askInBudget = model => ask(notes + text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
     const fallbackModel = process.env.LLM_FALLBACK_MODEL || (process.env.LLM_API_URL ? "" : DEFAULT_LLM_FALLBACK_MODEL);
     const llmStartedAt = Date.now();
@@ -493,4 +498,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isPersonalQuestion, isSearchIntent, safeHistory };

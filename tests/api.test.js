@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory } from "../api/index.js";
+import { aliceResponse, fitAliceText, isPersonalQuestion, isSearchIntent, safeHistory } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -276,4 +276,9 @@ test("memory remembers facts across sessions and forgets on request", async t =>
 
   assert.equal((await askHandler("забудь всё", [], session)).response.text, "Готово, я всё забыла.");
   assert.deepEqual(JSON.parse(store.get("alice:device-1")), { history: [], facts: [] });
+});
+
+test("personal questions are recognized, questions about the world are not", () => {
+  for (const q of ["как зовут моего кота", "напомни есть ли у меня животные", "что я просил запомнить", "когда день рождения моей мамы"]) assert.equal(isPersonalQuestion(q), true, q);
+  for (const q of ["есть ли у кошек паразиты", "какая погода в омске", "мойка машин рядом", "кто чемпион мира"]) assert.equal(isPersonalQuestion(q), false, q);
 });
