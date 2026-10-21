@@ -3,13 +3,15 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
-const SERPER_TIMEOUT_MS = 2500;
+const SEARCH_TIMEOUT_MS = 2500;
 const LLM_RESERVE_MS = 1800;
 const LLM_TIMEOUT_MS = 3000;
 const QUERY_REWRITE_TIMEOUT_MS = 1000;
-const RETRYABLE_LLM_ERRORS = ["LLM_EMPTY_RESPONSE", "LLM_REQUEST_FAILED"];
+const RETRYABLE_LLM_ERRORS = ["LLM_EMPTY_RESPONSE", "LLM_REQUEST_FAILED", "LLM_QUOTA"];
 const DEFAULT_LLM_API_URL = "https://api.groq.com/openai/v1/chat/completions";
 const DEFAULT_LLM_MODEL = "qwen/qwen3.8-27b";
+// Groq rate-limits each model separately, so a 429 on the main model can be retried on this one.
+const DEFAULT_LLM_FALLBACK_MODEL = "openai/gpt-oss-120b";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -105,9 +107,55 @@ async function fetchJson(url, options, timeoutMs) {
   }
 }
 
+// Exa first (fresh highlights with real numbers, $10 of free credit every month); Serper if Exa
+// errors out, e.g. when the monthly credit is spent. A timeout does not fall back: no time left.
 async function searchWeb(query, timeoutMs, limit = 5) {
+  if (timeoutMs < 150) return "";
+  if (process.env.EXA_API_KEY) {
+    const found = await searchExa(query, timeoutMs, limit);
+    if (found !== null || !process.env.SERPER_API_KEY) return found || "";
+  }
+  return process.env.SERPER_API_KEY ? searchSerper(query, timeoutMs, limit) : "";
+}
+
+// Returns "" on timeout, null on an HTTP error so the caller can try another provider.
+async function searchExa(query, timeoutMs, limit) {
+  try {
+    const { response, data } = await fetchJson(
+      "https://api.exa.ai/search",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${process.env.EXA_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ query, type: "instant", numResults: limit, contents: { highlights: { maxCharacters: 400 } } })
+      },
+      Math.min(SEARCH_TIMEOUT_MS, timeoutMs)
+    );
+
+    if (!response.ok) {
+      console.warn("Exa request failed with HTTP", response.status, data?.error || "");
+      return null;
+    }
+
+    return (Array.isArray(data.results) ? data.results : [])
+      .slice(0, limit)
+      .map((item, i) => {
+        const title = String(item.title || "").slice(0, 180);
+        const date = item.publishedDate ? ` (${String(item.publishedDate).slice(0, 10)})` : "";
+        const highlights = (Array.isArray(item.highlights) ? item.highlights : []).join(" … ").replace(/\s+/g, " ").slice(0, 400);
+        return `${i + 1}. ${title}${date}: ${highlights}`.trim();
+      })
+      .join("\n");
+  } catch (error) {
+    console.warn("Exa request did not finish in time; continuing without search.");
+    return "";
+  }
+}
+
+async function searchSerper(query, timeoutMs, limit) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
 
   try {
     const { response, data } = await fetchJson(
@@ -120,7 +168,7 @@ async function searchWeb(query, timeoutMs, limit = 5) {
         },
         body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: limit })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      Math.min(SEARCH_TIMEOUT_MS, timeoutMs)
     );
 
     if (!response.ok) {
@@ -183,7 +231,7 @@ async function chatCompletion(messages, options, timeoutMs) {
   return String(data?.choices?.[0]?.message?.content || "").trim();
 }
 
-async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
+async function askOpenAiCompatible(text, history, searchContext, timeoutMs, model) {
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const answer = await chatCompletion([
@@ -193,7 +241,7 @@ async function askOpenAiCompatible(text, history, searchContext, timeoutMs) {
       content: item.text
     })),
     { role: "user", content: buildPrompt(text, searchContext) }
-  ], { max_tokens: 240 }, Math.min(LLM_TIMEOUT_MS, timeoutMs));
+  ], { max_tokens: 240, ...(model && { model }) }, Math.min(LLM_TIMEOUT_MS, timeoutMs));
   if (!answer) throw new Error("LLM_EMPTY_RESPONSE");
   return answer;
 }
@@ -333,16 +381,16 @@ export default async function handler(req, res) {
     let searchContext = "";
     let searchMs = 0;
     let queryMs = 0;
-    if (process.env.SERPER_API_KEY && shouldSearch(text)) {
+    if ((process.env.EXA_API_KEY || process.env.SERPER_API_KEY) && shouldSearch(text)) {
       const queryStartedAt = Date.now();
       const queries = await buildSearchQueries(text, oldHistory);
       queryMs = Date.now() - queryStartedAt;
       if (queries.length) {
         // Alice waits 4.5 s; leave LLM_RESERVE_MS for a fast model plus network, search gets the rest.
-        const searchBudget = Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS));
+        const searchBudget = Math.min(SEARCH_TIMEOUT_MS, Math.max(0, remainingMs() - LLM_RESERVE_MS));
         const searchStartedAt = Date.now();
         // Two topics run in parallel with fewer results each to keep the prompt small.
-        const found = await Promise.all(queries.map(query => searchWeb(query, searchBudget, queries.length > 1 ? 3 : 5)));
+        const found = await Promise.all(queries.map(query => searchWeb(query, searchBudget, queries.length > 1 ? 2 : 3)));
         searchMs = Date.now() - searchStartedAt;
         console.log(`Search ${searchMs}ms ${found.map(item => item ? "ok" : "empty").join("/")}: ${queries.join(" | ")}`);
         const noResults = "результатов нет, не называй по этой теме никаких цифр и фактов, скажи, что не успела найти";
@@ -353,13 +401,16 @@ export default async function handler(req, res) {
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
-    const askInBudget = () => ask(text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)));
+    const askInBudget = model => ask(text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
+    const fallbackModel = process.env.LLM_FALLBACK_MODEL || (process.env.LLM_API_URL ? "" : DEFAULT_LLM_FALLBACK_MODEL);
     const llmStartedAt = Date.now();
     // Groq occasionally returns an empty answer or a 5xx; one retry fits in the budget.
+    // A rate limit is retried on the fallback model, which has its own limits.
     const answer = await askInBudget().catch(error => {
-      if (!RETRYABLE_LLM_ERRORS.includes(error?.message) || remainingMs() < 1500) throw error;
+      const quota = error?.message === "LLM_QUOTA";
+      if (!RETRYABLE_LLM_ERRORS.includes(error?.message) || (quota && !fallbackModel) || remainingMs() < 1500) throw error;
       console.warn("Retrying LLM after:", error.message);
-      return askInBudget();
+      return askInBudget(quota ? fallbackModel : undefined);
     }).finally(() => res.setHeader("Server-Timing", `query;dur=${queryMs}, search;dur=${searchMs}, llm;dur=${Date.now() - llmStartedAt}`));
 
     const history = [

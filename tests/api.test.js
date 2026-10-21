@@ -195,7 +195,54 @@ test("two topics become two parallel searches", async t => {
   t.after(() => { delete process.env.LLM_API_KEY; delete process.env.SERPER_API_KEY; });
 
   await askHandler("а в актау на выходных и курс кз-рф подскажи");
-  assert.deepEqual(serperQueries, [["погода в Актау на выходные", 3], ["курс тенге к рублю", 3]]);
+  assert.deepEqual(serperQueries, [["погода в Актау на выходные", 2], ["курс тенге к рублю", 2]]);
   assert.match(answerPrompt, /По запросу «погода в Актау на выходные»/);
   assert.match(answerPrompt, /По запросу «курс тенге к рублю»: результатов нет/);
+});
+
+test("Exa is used first and Serper only when Exa returns an error", async t => {
+  const calls = [];
+  let exaStatus = 200;
+  let answerPrompt = "";
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url.includes("exa.ai")) {
+      calls.push("exa");
+      if (exaStatus !== 200) return new Response(JSON.stringify({ error: "credits exhausted" }), { status: exaStatus });
+      return new Response(JSON.stringify({ results: [{ title: "Погода в Астане", publishedDate: "2026-10-21T00:00:00Z", highlights: ["днём +6…+8 °C"] }] }), { status: 200 });
+    }
+    if (url.includes("serper")) {
+      calls.push("serper");
+      return new Response(JSON.stringify({ organic: [{ title: "Serper", snippet: "s", link: "l" }] }), { status: 200 });
+    }
+    if (body.max_tokens !== 60) answerPrompt = body.messages.at(-1).content;
+    return new Response(JSON.stringify({ choices: [{ message: { content: body.max_tokens === 60 ? "погода в Астане" : "ответ" } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  process.env.EXA_API_KEY = "test";
+  process.env.SERPER_API_KEY = "test";
+  t.after(() => { delete process.env.LLM_API_KEY; delete process.env.EXA_API_KEY; delete process.env.SERPER_API_KEY; });
+
+  await askHandler("какая погода в астане");
+  assert.deepEqual(calls, ["exa"]);
+  assert.match(answerPrompt, /Погода в Астане \(2026-10-21\): днём \+6…\+8 °C/);
+
+  exaStatus = 402;
+  await askHandler("какая погода в астане");
+  assert.deepEqual(calls, ["exa", "exa", "serper"]);
+});
+
+test("rate-limited answer is retried on the fallback model", async t => {
+  const models = [];
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    models.push(body.model);
+    if (models.length === 1) return new Response(JSON.stringify({ error: { message: "rate limit" } }), { status: 429 });
+    return new Response(JSON.stringify({ choices: [{ message: { content: "Привет!" } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  t.after(() => delete process.env.LLM_API_KEY);
+  const payload = await askHandler("привет");
+  assert.equal(payload.response.text, "Привет!");
+  assert.deepEqual(models, ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]);
 });
