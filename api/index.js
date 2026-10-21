@@ -440,7 +440,7 @@ export default async function handler(req, res) {
 
   if (!text) {
     return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+      "Привет! Что хочешь узнать?",
       false,
       oldHistory
     ));
