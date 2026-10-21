@@ -1,4 +1,3 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 12;
 const QUERY_REWRITE_HISTORY_MESSAGES = 6;
 const MEMORY_TTL_SECONDS = 30 * 24 * 3600;
@@ -251,10 +250,10 @@ function buildPrompt(text, searchContext) {
     : text;
 }
 
-function checkLlmResponse(response, data, provider) {
+function checkLlmResponse(response, data) {
   if (response.ok) return;
   const status = Number(response.status);
-  console.error(`${provider} request failed with HTTP`, status, data?.error?.message || "");
+  console.error("LLM request failed with HTTP", status, data?.error?.message || "");
   if (status === 401 || status === 403) throw new Error("LLM_KEY_REJECTED");
   if (status === 429) throw new Error("LLM_QUOTA");
   throw new Error("LLM_REQUEST_FAILED");
@@ -278,11 +277,12 @@ async function chatCompletion(messages, options, timeoutMs) {
     },
     timeoutMs
   );
-  checkLlmResponse(response, data, "LLM");
+  checkLlmResponse(response, data);
   return String(data?.choices?.[0]?.message?.content || "").trim();
 }
 
-async function askOpenAiCompatible(text, history, searchContext, timeoutMs, model) {
+async function askLlm(text, history, searchContext, timeoutMs, model) {
+  if (!process.env.LLM_API_KEY) throw new Error("MISSING_LLM_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
   const answer = await chatCompletion([
@@ -343,67 +343,14 @@ async function buildSearchQueries(text, history) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_LLM_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
-
-  contents.push({ role: "user", parts: [{ text: buildPrompt(text, searchContext) }] });
-
-  const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt() }] },
-        contents,
-        generationConfig: {
-          maxOutputTokens: 240
-        }
-      })
-    },
-    Math.min(LLM_TIMEOUT_MS, timeoutMs)
-  );
-  checkLlmResponse(response, data, "Gemini");
-
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("LLM_BLOCKED");
-    throw new Error("LLM_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
-}
-
 function errorForUser(error) {
   switch (error?.message) {
     case "MISSING_LLM_KEY":
-      return "Сервер пока не настроен. Добавьте LLM_API_KEY или GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер пока не настроен. Добавьте LLM_API_KEY в настройках Vercel.";
     case "LLM_KEY_REJECTED":
       return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
     case "LLM_QUOTA":
       return "Сейчас превышен лимит запросов к нейросети. Попробуйте немного позже.";
-    case "LLM_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
@@ -487,13 +434,12 @@ export default async function handler(req, res) {
       }
     }
 
-    const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
     const notes = facts.length
       ? `Пользователь раньше просил запомнить (это точные факты о нём, они важнее результатов поиска):\n- ${facts.join("\n- ")}\n\n`
       : memory && isPersonalQuestion(text)
         ? "Пользователь ничего не просил запомнить. Если ответа нет и в истории диалога, скажи, что он тебе об этом не рассказывал, и предложи сказать «запомни, что …».\n\n"
         : "";
-    const askInBudget = model => ask(notes + text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
+    const askInBudget = model => askLlm(notes + text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
     const fallbackModel = process.env.LLM_FALLBACK_MODEL || (process.env.LLM_API_URL ? "" : DEFAULT_LLM_FALLBACK_MODEL);
     const llmStartedAt = Date.now();
     // Groq occasionally returns an empty answer or a 5xx; one retry fits in the budget.

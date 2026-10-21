@@ -78,8 +78,8 @@ test("slow model answer becomes a timeout message", async t => {
   t.mock.method(globalThis, "fetch", (url, { signal }) => new Promise((_, reject) => {
     signal.addEventListener("abort", () => reject(new DOMException("This operation was aborted", "AbortError")));
   }));
-  process.env.GEMINI_API_KEY = "test";
-  t.after(() => delete process.env.GEMINI_API_KEY);
+  process.env.LLM_API_KEY = "test";
+  t.after(() => delete process.env.LLM_API_KEY);
   const payload = await askHandler("привет");
   assert.match(payload.response.text, /Не успела/);
 });
