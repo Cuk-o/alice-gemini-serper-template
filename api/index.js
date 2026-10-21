@@ -1,5 +1,9 @@
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
-const MAX_HISTORY_MESSAGES = 8;
+const MAX_HISTORY_MESSAGES = 12;
+const QUERY_REWRITE_HISTORY_MESSAGES = 6;
+const MEMORY_TTL_SECONDS = 30 * 24 * 3600;
+const MEMORY_TIMEOUT_MS = 300;
+const MAX_FACTS = 20;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4200;
@@ -92,6 +96,43 @@ function safeHistory(history) {
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+// Long-term memory in Upstash Redis (Vercel Marketplace injects KV_*, a direct Upstash setup uses UPSTASH_*).
+// Without it, or if it is slow, the skill falls back to Yandex session_state.
+async function redisPipeline(commands) {
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  if (!url || !token) return null;
+  try {
+    const { response, data } = await fetchJson(`${url}/pipeline`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(commands)
+    }, MEMORY_TIMEOUT_MS);
+    if (!response.ok || !Array.isArray(data)) throw new Error(`HTTP ${response.status}`);
+    return data.map(item => item.result);
+  } catch (error) {
+    console.warn("Memory store unavailable:", error?.message || "unknown error");
+    return null;
+  }
+}
+
+async function loadMemory(userId) {
+  if (!userId) return null;
+  const [raw] = await redisPipeline([["GET", `alice:${userId}`]]) || [];
+  if (raw === undefined) return null;
+  try {
+    const memory = JSON.parse(raw || "{}");
+    return { history: safeHistory(memory.history), facts: Array.isArray(memory.facts) ? memory.facts.filter(f => typeof f === "string") : [] };
+  } catch {
+    return { history: [], facts: [] };
+  }
+}
+
+async function saveMemory(userId, memory) {
+  if (!userId) return;
+  await redisPipeline([["SET", `alice:${userId}`, JSON.stringify(memory), "EX", MEMORY_TTL_SECONDS]]);
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -266,6 +307,7 @@ async function buildSearchQueries(text, history) {
   if (!process.env.LLM_API_KEY) return fallback;
 
   const dialog = safeHistory(history)
+    .slice(-QUERY_REWRITE_HISTORY_MESSAGES)
     .map(item => `${item.role === "model" ? "Ассистент" : "Пользователь"}: ${item.text}`)
     .concat(`Пользователь: ${text}`)
     .join("\n");
@@ -374,7 +416,22 @@ export default async function handler(req, res) {
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
+  const userId = body?.session?.user?.user_id || body?.session?.application?.application_id || "";
+  const memory = await loadMemory(userId);
+  const oldHistory = memory ? memory.history : safeHistory(body?.state?.session?.history);
+  const facts = memory?.facts || [];
+
+  if (/^(забудь вс[её]|очисти память)/i.test(text)) {
+    await saveMemory(userId, { history: [], facts: [] });
+    return res.status(200).json(aliceResponse("Готово, я всё забыла.", false, []));
+  }
+
+  const fact = text.match(/^запомни[,:]?\s+(?:что\s+)?(.+)/i)?.[1];
+  if (fact && memory) {
+    const history = [...oldHistory, { role: "user", text }, { role: "model", text: "Запомнила." }].slice(-MAX_HISTORY_MESSAGES);
+    await saveMemory(userId, { history, facts: [...facts, fact.slice(0, 300)].slice(-MAX_FACTS) });
+    return res.status(200).json(aliceResponse("Запомнила.", false, history));
+  }
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -408,7 +465,8 @@ export default async function handler(req, res) {
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
-    const askInBudget = model => ask(text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
+    const notes = facts.length ? `Пользователь раньше просил запомнить:\n- ${facts.join("\n- ")}\n\n` : "";
+    const askInBudget = model => ask(notes + text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
     const fallbackModel = process.env.LLM_FALLBACK_MODEL || (process.env.LLM_API_URL ? "" : DEFAULT_LLM_FALLBACK_MODEL);
     const llmStartedAt = Date.now();
     // Groq occasionally returns an empty answer or a 5xx; one retry fits in the budget.
@@ -426,6 +484,7 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
+    if (memory) await saveMemory(userId, { history, facts });
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
     const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;

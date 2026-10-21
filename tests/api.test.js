@@ -22,13 +22,13 @@ test("long responses are cut at a natural boundary and stay within Alice limit",
   assert.ok(value.endsWith("."));
 });
 
-test("history filters malformed messages and keeps last 8", () => {
-  const input = Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? "model" : "user", text: String(i) }));
+test("history filters malformed messages and keeps last 12", () => {
+  const input = Array.from({ length: 16 }, (_, i) => ({ role: i % 2 ? "model" : "user", text: String(i) }));
   input.push({ role: "hacker", text: "ignore" }, { role: "user", text: 17 });
   const result = safeHistory(input);
-  assert.equal(result.length, 8);
+  assert.equal(result.length, 12);
   assert.equal(result[0].text, "4");
-  assert.equal(result[7].text, "11");
+  assert.equal(result[11].text, "15");
 });
 
 test("GET health check returns an ok response", async () => {
@@ -62,7 +62,7 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.equal(payload.response.end_session, false);
 });
 
-async function askHandler(command, history = []) {
+async function askHandler(command, history = [], session = {}) {
   const handler = (await import("../api/index.js")).default;
   let payload;
   const res = {
@@ -70,7 +70,7 @@ async function askHandler(command, history = []) {
     json(value) { payload = value; return value; },
     setHeader() {}
   };
-  await handler({ method: "POST", body: { request: { command }, state: { session: { history } } } }, res);
+  await handler({ method: "POST", body: { session, request: { command }, state: { session: { history } } } }, res);
   return payload;
 }
 
@@ -245,4 +245,35 @@ test("rate-limited answer is retried on the fallback model", async t => {
   const payload = await askHandler("привет");
   assert.equal(payload.response.text, "Привет!");
   assert.deepEqual(models, ["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]);
+});
+
+test("memory remembers facts across sessions and forgets on request", async t => {
+  const store = new Map();
+  let answerPrompt = "";
+  t.mock.method(globalThis, "fetch", async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (url.endsWith("/pipeline")) {
+      return new Response(JSON.stringify(body.map(([cmd, key, value]) => {
+        if (cmd === "GET") return { result: store.get(key) ?? null };
+        store.set(key, value);
+        return { result: "OK" };
+      })), { status: 200 });
+    }
+    answerPrompt = body.messages.at(-1).content;
+    return new Response(JSON.stringify({ choices: [{ message: { content: "Барсик." } }] }), { status: 200 });
+  });
+  process.env.LLM_API_KEY = "test";
+  process.env.KV_REST_API_URL = "https://redis.test";
+  process.env.KV_REST_API_TOKEN = "test";
+  t.after(() => { delete process.env.LLM_API_KEY; delete process.env.KV_REST_API_URL; delete process.env.KV_REST_API_TOKEN; });
+  const session = { application: { application_id: "device-1" } };
+
+  assert.equal((await askHandler("запомни что кота зовут Барсик", [], session)).response.text, "Запомнила.");
+  // A new session sends no session_state history; memory comes from Redis.
+  await askHandler("как зовут кота", [], session);
+  assert.match(answerPrompt, /кота зовут Барсик/);
+  assert.equal(JSON.parse(store.get("alice:device-1")).history.length, 4);
+
+  assert.equal((await askHandler("забудь всё", [], session)).response.text, "Готово, я всё забыла.");
+  assert.deepEqual(JSON.parse(store.get("alice:device-1")), { history: [], facts: [] });
 });
