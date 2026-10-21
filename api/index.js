@@ -22,6 +22,8 @@ const SYSTEM_PROMPT = [
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Поиск в интернете выполняется автоматически, его результаты приходят вместе с вопросом. Никогда не говори, что не умеешь искать.",
   "Результаты поиска свежее твоих знаний: если они расходятся с тем, что ты помнишь, верь поиску. Не выдумывай отсутствующие факты.",
+  "Отвечай только на последний вопрос, без подробностей, о которых не спрашивали. Если в результатах поиска разные цифры, назови одну: официальную или самую свежую по дате.",
+  "Различай «уже вышло» и «выйдет»: сверяй даты событий с сегодняшней датой.",
   "Если не знаешь ответа, честно скажи об этом.",
   "Твои знания могут быть устаревшими: если вопрос о текущем положении дел, а результатов поиска нет, скажи, что не получилось проверить в интернете, и предложи повторить вопрос."
 ].join(" ");
@@ -241,7 +243,12 @@ async function askOpenAiCompatible(text, history, searchContext, timeoutMs, mode
       content: item.text
     })),
     { role: "user", content: buildPrompt(text, searchContext) }
-  ], { max_tokens: 240, ...(model && { model }) }, Math.min(LLM_TIMEOUT_MS, timeoutMs));
+  ], {
+    max_tokens: 240,
+    ...(model && { model }),
+    // gpt-oss reasons before answering; at the default effort that can use up all 240 tokens.
+    ...(model?.startsWith("openai/gpt-oss") && { reasoning_effort: "low" })
+  }, Math.min(LLM_TIMEOUT_MS, timeoutMs));
   if (!answer) throw new Error("LLM_EMPTY_RESPONSE");
   return answer;
 }
