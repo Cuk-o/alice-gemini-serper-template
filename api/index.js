@@ -299,7 +299,7 @@ function shouldSearch(text) {
   return isSearchIntent(text) || text.split(/\s+/).length > 1;
 }
 
-// «как зовут моего кота» must come from memory: web results about other people's cats confuse the model.
+// «как зовут моего кота» must come from memory or the dialog: web results about other people's cats confuse the model.
 function isPersonalQuestion(text) {
   return /(^|\s)(мо(й|я|ё|е|его|ей|ему|им|их|ими)|у меня есть|есть ли у меня|я (просил|говорил|рассказывал)а?|напомни)(?=[\s,?!.]|$)/i.test(text);
 }
@@ -450,7 +450,7 @@ export default async function handler(req, res) {
     let searchContext = "";
     let searchMs = 0;
     let queryMs = 0;
-    if ((process.env.EXA_API_KEY || process.env.SERPER_API_KEY) && shouldSearch(text) && !(facts.length && isPersonalQuestion(text))) {
+    if ((process.env.EXA_API_KEY || process.env.SERPER_API_KEY) && shouldSearch(text) && !isPersonalQuestion(text)) {
       const queryStartedAt = Date.now();
       const queries = await buildSearchQueries(text, oldHistory);
       queryMs = Date.now() - queryStartedAt;
@@ -470,7 +470,11 @@ export default async function handler(req, res) {
     }
 
     const ask = process.env.LLM_API_KEY ? askOpenAiCompatible : askGemini;
-    const notes = facts.length ? `Пользователь раньше просил запомнить (это точные факты о нём, они важнее результатов поиска):\n- ${facts.join("\n- ")}\n\n` : "";
+    const notes = facts.length
+      ? `Пользователь раньше просил запомнить (это точные факты о нём, они важнее результатов поиска):\n- ${facts.join("\n- ")}\n\n`
+      : memory && isPersonalQuestion(text)
+        ? "Пользователь ничего не просил запомнить. Если ответа нет и в истории диалога, скажи, что он тебе об этом не рассказывал, и предложи сказать «запомни, что …».\n\n"
+        : "";
     const askInBudget = model => ask(notes + text, oldHistory, searchContext, Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600)), model);
     const fallbackModel = process.env.LLM_FALLBACK_MODEL || (process.env.LLM_API_URL ? "" : DEFAULT_LLM_FALLBACK_MODEL);
     const llmStartedAt = Date.now();
